@@ -133,7 +133,10 @@ export class EventService implements OnModuleInit, OnModuleDestroy {
     // 이벤트 구독 시도 (eth_newFilter 지원하는 경우)
     try {
       const listener = (...args: unknown[]) => {
-        const event = args[args.length - 1] as ethers.Log;
+        const event = args[args.length - 1] as
+          | ethers.Log
+          | ethers.EventLog
+          | ethers.ContractEventPayload;
 
         this.handleEvent(event, subscription).catch((error) => {
           this.logger.error(
@@ -206,19 +209,43 @@ export class EventService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async handleEvent(
-    event: ethers.Log,
+    event: ethers.Log | ethers.EventLog | ethers.ContractEventPayload,
     subscription: SubscriptionEntity,
   ): Promise<void> {
     const collectedEvent = await this.saveEvent(event, subscription);
     this.eventStream.next(collectedEvent);
 
+    const blockNumber = this.extractBlockNumber(event);
     this.logger.debug(
-      `이벤트 수집됨: ${subscription.eventName} (블록: ${event.blockNumber})`,
+      `이벤트 수집됨: ${subscription.eventName} (블록: ${blockNumber})`,
     );
   }
 
+  private extractBlockNumber(
+    event: ethers.Log | ethers.EventLog | ethers.ContractEventPayload,
+  ): number {
+    // ContractEventPayload 타입인 경우
+    if ('log' in event && event.log) {
+      const log = event.log;
+      if (log.blockNumber !== null && log.blockNumber !== undefined) {
+        return Number(log.blockNumber);
+      }
+    }
+
+    // EventLog 타입인 경우
+    if (
+      'blockNumber' in event &&
+      event.blockNumber !== null &&
+      event.blockNumber !== undefined
+    ) {
+      return Number(event.blockNumber);
+    }
+
+    return 0;
+  }
+
   private async saveEvent(
-    event: ethers.Log,
+    event: ethers.Log | ethers.EventLog | ethers.ContractEventPayload,
     subscription: SubscriptionEntity,
   ): Promise<CollectedEventEntity> {
     const eventData = this.parseEventData(
@@ -227,13 +254,67 @@ export class EventService implements OnModuleInit, OnModuleDestroy {
       subscription.eventName,
     );
 
+    // blockNumber와 transactionHash 안전하게 추출
+    let blockNumber: number = 0;
+    let transactionHash: string = '';
+
+    // ContractEventPayload 타입인 경우 (contract.on()으로 받은 이벤트)
+    if ('log' in event && event.log) {
+      const log: ethers.Log | ethers.EventLog = event.log;
+      if (log.blockNumber !== null && log.blockNumber !== undefined) {
+        blockNumber = Number(log.blockNumber);
+      }
+      if (log.transactionHash) {
+        transactionHash = String(log.transactionHash);
+      }
+    }
+    // EventLog 타입인 경우 (queryFilter로 받은 이벤트)
+    else if (
+      'blockNumber' in event &&
+      event.blockNumber !== null &&
+      event.blockNumber !== undefined
+    ) {
+      blockNumber = Number(event.blockNumber);
+      if ('transactionHash' in event && event.transactionHash) {
+        transactionHash = String(event.transactionHash);
+      }
+    }
+    // Log 타입인 경우 blockHash로부터 조회
+    else if ('blockHash' in event && event.blockHash) {
+      try {
+        const provider = this.chainService.getProvider(subscription.chainId);
+        if (provider) {
+          const block = await provider.getBlock(event.blockHash);
+          blockNumber = block?.number ?? 0;
+        }
+      } catch (error) {
+        this.logger.warn(`블록 번호 조회 실패: ${event.blockHash}`, error);
+      }
+
+      if ('transactionHash' in event && event.transactionHash) {
+        transactionHash = String(event.transactionHash);
+      } else if ('hash' in event && event.hash) {
+        const hash = event.hash;
+        transactionHash = typeof hash === 'string' ? hash : '';
+      }
+    }
+
+    if (!blockNumber || !transactionHash) {
+      this.logger.error(
+        `이벤트에 필수 정보가 없습니다. event keys: ${Object.keys(event).join(', ')}, blockNumber: ${blockNumber}, transactionHash: ${transactionHash}`,
+      );
+      throw new Error(
+        `이벤트에 필수 정보가 없습니다: blockNumber=${blockNumber}, transactionHash=${transactionHash}`,
+      );
+    }
+
     const collectedEvent = this.eventRepository.create({
       subscriptionId: subscription.id,
       chainId: subscription.chainId,
       contractAddress: subscription.contractAddress,
       eventName: subscription.eventName,
-      blockNumber: event.blockNumber,
-      transactionHash: event.transactionHash,
+      blockNumber,
+      transactionHash,
       data: eventData,
     });
 
@@ -242,20 +323,26 @@ export class EventService implements OnModuleInit, OnModuleDestroy {
   }
 
   private parseEventData(
-    event: ethers.Log,
+    event: ethers.Log | ethers.EventLog | ethers.ContractEventPayload,
     abi: unknown[],
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     _eventName: string,
   ): Record<string, string> {
     try {
+      // ContractEventPayload인 경우 log에서 데이터 추출
+      const log: ethers.Log | ethers.EventLog =
+        'log' in event && event.log
+          ? event.log
+          : (event as ethers.Log | ethers.EventLog);
+
       const iface = new ethers.Interface(abi as ethers.InterfaceAbi);
       const parsed = iface.parseLog({
-        topics: event.topics as string[],
-        data: event.data,
+        topics: log.topics as string[],
+        data: log.data,
       });
 
       if (!parsed) {
-        return { raw: event.data };
+        return { raw: log.data };
       }
 
       const result: Record<string, string> = {};
@@ -270,7 +357,11 @@ export class EventService implements OnModuleInit, OnModuleDestroy {
       return result;
     } catch (error) {
       this.logger.warn('이벤트 파싱 실패', error);
-      return { raw: event.data };
+      const log: ethers.Log | ethers.EventLog =
+        'log' in event && event.log
+          ? event.log
+          : (event as ethers.Log | ethers.EventLog);
+      return { raw: log.data };
     }
   }
 
